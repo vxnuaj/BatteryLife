@@ -79,6 +79,20 @@ with identical results. You can also **stage by domain** — CALB ≈ 50 MB, Na-
 Zn-ion ≈ 3 GB; Li-ion (ISU_ILCC+MATR+…) is ~all the bulk — so validate H1/H2/H3 on the small
 domains first and pull Li-ion last.
 
+## Verify before you apply (don't trust — screen it)
+`scripts/verify_optimization.py` runs the **real loader code** (`read_cell_df` →
+`get_charge_discharge_curves`, the exact resampling/normalization training uses) on every
+cell under `dataset/`, comparing FULL vs a 100-cycle-truncated copy, and asserts the produced
+`[L,3,300]` curves and the label are **exactly** equal — plus prints the label distribution
+full vs slim. Run it on your data **before** `build_slim_dataset.py`:
+```bash
+python scripts/verify_optimization.py     # expect: PASS — slim ... identical to full
+```
+Result on the dev subset (4 of 6 cells actually truncated, incl. MATR 786→100, ZN-coin 391→100):
+all 6 curves byte-identical, labels identical, label distribution unchanged
+(`mean=293.0 std=236.4 min=105 med=200 max=786` for both). Re-run on the full data on the GPU
+box to screen every cell before committing to the slim.
+
 ## Why it's lossless / correct
 - Slim: cycles ≤100 are byte-identical (verified); the label is read from JSON regardless; the
   loader never touches cycles >100.
