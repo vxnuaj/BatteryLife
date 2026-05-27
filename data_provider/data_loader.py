@@ -256,7 +256,37 @@ class Dataset_original(Dataset):
                 self.unseen_seen_record = json.load(open(f'{self.root_path}/seen_unseen_labels/cal_for_test.json'))
             # self.unseen_seen_record = json.load(open(f'{self.root_path}/cal_for_test.json'))
         
-        self.total_charge_discharge_curves, self.total_curve_attn_masks, self.total_labels, self.unique_labels, self.class_labels, self.total_dataset_ids, self.total_cj_aug_charge_discharge_curves, self.total_seen_unseen_IDs = self.read_data()
+        # [SPEED] optional cache of the fully-resampled read_data() output. read_data is the
+        # expensive step (loads every pkl + resamples ≤100 cycles to [L,3,300]); its result is
+        # deterministic given (dataset, flag, charge_discharge_length, early_cycle_threshold,
+        # input_channels). With --use_cache, the first run builds a small .pkl cache (~MBs/split)
+        # and every later run loads it instantly (no pkl reads, no resampling). After building it
+        # you can delete the heavy cell pkls. Cache bundle includes the H3 domain side-arrays.
+        _use_cache = getattr(args, 'use_cache', False)
+        _cache_path = None
+        if _use_cache:
+            _ich = getattr(args, 'input_channels', 'base')
+            _cache_dir = os.path.join(self.root_path, '.cache')
+            _cache_path = os.path.join(
+                _cache_dir,
+                f"{self.dataset}_{flag}_cdl{self.charge_discharge_len}_ect{self.early_cycle_threshold}_{_ich}_v1.pkl")
+        if _use_cache and _cache_path is not None and os.path.exists(_cache_path):
+            with open(_cache_path, 'rb') as _cf:
+                _b = pickle.load(_cf)
+            (self.total_charge_discharge_curves, self.total_curve_attn_masks, self.total_labels,
+             self.unique_labels, self.class_labels, self.total_dataset_ids,
+             self.total_cj_aug_charge_discharge_curves, self.total_seen_unseen_IDs,
+             self.total_domain_ids, self.unique_label_domains) = _b
+        else:
+            self.total_charge_discharge_curves, self.total_curve_attn_masks, self.total_labels, self.unique_labels, self.class_labels, self.total_dataset_ids, self.total_cj_aug_charge_discharge_curves, self.total_seen_unseen_IDs = self.read_data()
+            if _use_cache and _cache_path is not None:
+                os.makedirs(os.path.dirname(_cache_path), exist_ok=True)
+                with open(_cache_path, 'wb') as _cf:
+                    pickle.dump((self.total_charge_discharge_curves, self.total_curve_attn_masks,
+                                 self.total_labels, self.unique_labels, self.class_labels,
+                                 self.total_dataset_ids, self.total_cj_aug_charge_discharge_curves,
+                                 self.total_seen_unseen_IDs, self.total_domain_ids,
+                                 self.unique_label_domains), _cf)
         
         self.KDE_samples = copy.deepcopy(self.total_labels) if flag == 'train' else []
 

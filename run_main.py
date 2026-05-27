@@ -112,6 +112,9 @@ parser.add_argument('--domain_cond', type=str, default='film', choices=['film', 
 parser.add_argument('--num_domains', type=int, default=4, help='[H3] number of domains (Li-ion/Zn-ion/Na-ion/CALB)')
 parser.add_argument('--label_scaling', type=str, default='global', choices=['global', 'per_domain', 'log'],
                     help='[H3] label scaling for joint training; per_domain fits one scaler per domain')
+parser.add_argument('--use_cache', action='store_true', default=False,
+                    help='[SPEED] cache the resampled read_data() output per split under dataset/.cache; '
+                         'first run builds it, later runs load instantly (no pkl reads / resampling)')
 parser.add_argument('--class_num', type=int, default=8, help='The number of life classes')
 
 # optimization

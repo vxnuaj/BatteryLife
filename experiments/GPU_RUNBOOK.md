@@ -37,9 +37,15 @@ For a single GPU: `num_process=1`, `CUDA_VISIBLE_DEVICES=0` (you may also drop `
 ## 4. Data
 ```bash
 hf auth login                             # + accept terms at huggingface.co/datasets/Battery-Life/BatteryLife_Processed
-hf download Battery-Life/BatteryLife_Processed --repo-type dataset --local-dir dataset/   # ~86 GB
+# Skip the 24.3 GB the benchmark never uses, then slim + cache (see DATASET_OPTIMIZATION.md):
+hf download Battery-Life/BatteryLife_Processed --repo-type dataset --local-dir dataset/ \
+    --exclude "SDU/*" "Stanford_2/*"
+python scripts/build_slim_dataset.py --root dataset/        # truncate to 100 cycles (lossless)
+# then add --use_cache to runs; the first build lets you run from a few hundred MB.
 ```
 `dataset/` is gitignored except the tracked `seen_unseen_labels/` (needed by eval).
+**Full storage/speed plan + numbers: [`DATASET_OPTIMIZATION.md`](DATASET_OPTIMIZATION.md)**
+(86 GB → a few hundred MB, identical results). The naive full download still works if you prefer.
 
 ## 5. Run order (do these in sequence)
 
