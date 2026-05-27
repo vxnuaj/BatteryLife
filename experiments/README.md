@@ -57,6 +57,10 @@ plus flag-gated edits to `models/CPMLP.py`, `models/CPTransformer.py`, `run_main
 
 ## Running an experiment (on a GPU)
 
+> **Operator checklist with the exact setup/edit gotchas + run order:
+> [`GPU_RUNBOOK.md`](GPU_RUNBOOK.md).** (Scripts ship with placeholder `checkpoints=` paths and
+> a 2-GPU assumption you must edit; H3's glue needs a subset validation run first.) Summary:
+
 1. **Set up** (GPU box): `pip install -r ../requirements.txt` (+ BatteryML per README), then
    download data: `hf download Battery-Life/BatteryLife_Processed --repo-type dataset --local-dir ../dataset/`.
 2. **CPU sanity** (anywhere): `python experiments/hN/smoke_test.py` → expect `ALL CHECKS PASSED`.
