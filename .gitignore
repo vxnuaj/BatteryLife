@@ -9,3 +9,13 @@ dev/
 .qwen/
 results/
 analysis/
+checkpoints/
+*.log
+
+# Downloaded battery data (86 GB on HuggingFace; pulled per-machine, never committed).
+# Keep the small tracked seen_unseen_labels/ that the repo ships and the eval code needs.
+dataset/*
+!dataset/seen_unseen_labels/
+
+# Local reference copy of the paper (source on arXiv 2502.18807; not part of our work).
+paper/
