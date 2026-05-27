@@ -99,6 +99,19 @@ parser.add_argument('--patch_len2', type=int, default=10, help='patch length for
 parser.add_argument('--stride2', type=int, default=10, help='stride for inter-cycle patching')
 parser.add_argument('--prompt_domain', type=int, default=0, help='')
 parser.add_argument('--output_num', type=int, default=1, help='The number of prediction targets')
+parser.add_argument('--intra_encoder', type=str, default='linear', choices=['linear', 'conv'],
+                    help='[H1] intra-cycle encoder for CyclePatch models: '
+                         'linear = original flatten->Linear (SOTA default); conv = 1-D CNN over each cycle')
+parser.add_argument('--input_channels', type=str, default='base', choices=['base', 'physics'],
+                    help='[H2] per-cycle input channels: base = raw [V,I,Q] (SOTA default); '
+                         'physics = base + dQ/dV + deltaQ(V). Set --enc_in to match the total count.')
+parser.add_argument('--multidomain', type=str, default='off', choices=['off', 'on'],
+                    help='[H3] joint multi-domain training with domain conditioning (default off = single-domain SOTA)')
+parser.add_argument('--domain_cond', type=str, default='film', choices=['film', 'concat', 'heads'],
+                    help='[H3] domain-conditioning mechanism when --multidomain on')
+parser.add_argument('--num_domains', type=int, default=4, help='[H3] number of domains (Li-ion/Zn-ion/Na-ion/CALB)')
+parser.add_argument('--label_scaling', type=str, default='global', choices=['global', 'per_domain', 'log'],
+                    help='[H3] label scaling for joint training; per_domain fits one scaler per domain')
 parser.add_argument('--class_num', type=int, default=8, help='The number of life classes')
 
 # optimization
@@ -203,8 +216,12 @@ for ii in range(args.itr):
     
     accelerator.print("Loading training samples......")
     train_data, train_loader = data_provider_func(args, 'train', None, sample_weighted=args.weighted_sampling)
-    label_scaler = train_data.return_label_scaler()  
-    life_class_scaler = train_data.return_life_class_scaler()    
+    label_scaler = train_data.return_label_scaler()
+    life_class_scaler = train_data.return_life_class_scaler()
+    # [H3] stash per-domain label stats so val/test datasets reuse TRAIN statistics
+    if getattr(args, 'multidomain', 'off') == 'on' and getattr(args, 'label_scaling', 'global') == 'per_domain':
+        args._domain_means = train_data.domain_means
+        args._domain_stds = train_data.domain_stds
     accelerator.print("Loading vali samples......")
     vali_data, vali_loader = data_provider_func(args, 'val', None, label_scaler, life_class_scaler=life_class_scaler, sample_weighted=args.weighted_sampling)
     accelerator.print("Loading test samples......")
@@ -306,7 +323,14 @@ for ii in range(args.itr):
         print_life_class_loss = 0
         std, mean_value = np.sqrt(train_data.label_scaler.var_[-1]), train_data.label_scaler.mean_[-1]
         total_preds, total_references = [], []
-        for i, (cycle_curve_data, curve_attn_mask,  labels, life_class, scaled_life_class, weights, seen_unseen_ids) in enumerate(train_loader):
+        for i, batch in enumerate(train_loader):
+            # [H3] joint multi-domain batches carry an extra domain_id; default path is the 7-tuple
+            if getattr(args, 'multidomain', 'off') == 'on':
+                cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids, domain_id = batch
+                domain_id = domain_id.to(accelerator.device)
+            else:
+                cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids = batch
+                domain_id = None
             with accelerator.accumulate(model):
                 model_optim.zero_grad()
                 iter_count += 1
@@ -319,7 +343,10 @@ for ii in range(args.itr):
                 
 
                 # encoder - decoder
-                outputs = model(cycle_curve_data, curve_attn_mask)
+                if domain_id is not None:
+                    outputs = model(cycle_curve_data, curve_attn_mask, domain_id=domain_id)  # [H3]
+                else:
+                    outputs = model(cycle_curve_data, curve_attn_mask)
                 
 
                 cut_off = labels.shape[0]
@@ -342,8 +369,15 @@ for ii in range(args.itr):
                 total_cl_loss += print_cl_loss
                 total_lc_loss += print_life_class_loss
 
-                transformed_preds = outputs[:cut_off] * std + mean_value
-                transformed_labels = labels[:cut_off]  * std + mean_value
+                if domain_id is not None and getattr(args, 'label_scaling', 'global') == 'per_domain':
+                    # [H3] per-domain inverse-transform using TRAIN domain stats
+                    dmean = torch.as_tensor(args._domain_means, device=accelerator.device, dtype=outputs.dtype)[domain_id[:cut_off]]
+                    dstd = torch.as_tensor(args._domain_stds, device=accelerator.device, dtype=outputs.dtype)[domain_id[:cut_off]]
+                    transformed_preds = outputs[:cut_off].reshape(-1) * dstd + dmean
+                    transformed_labels = labels[:cut_off].reshape(-1) * dstd + dmean
+                else:
+                    transformed_preds = outputs[:cut_off] * std + mean_value
+                    transformed_labels = labels[:cut_off]  * std + mean_value
                 all_predictions, all_targets = accelerator.gather_for_metrics((transformed_preds, transformed_labels))
                 
                 total_preds = total_preds + all_predictions.detach().cpu().numpy().reshape(-1).tolist()

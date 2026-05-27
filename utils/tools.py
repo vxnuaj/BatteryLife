@@ -215,31 +215,60 @@ def del_files(dir_path):
 def vali_baseline(args, accelerator, model, vali_data, vali_loader, criterion, compute_seen_unseen=False):
     total_preds, total_references = [], []
     total_seen_unseen_ids = []
+    total_domain_ids = []   # [H3]
+    multidomain = getattr(args, 'multidomain', 'off') == 'on'
     model.eval()
     with torch.no_grad():
-        for i, (cycle_curve_data, curve_attn_mask,  labels, life_class, scaled_life_class, weights, seen_unseen_ids) in tqdm(enumerate(vali_loader)):
+        for i, batch in tqdm(enumerate(vali_loader)):
+            # [H3] multi-domain batches carry an extra domain_id; default path is the 7-tuple
+            if multidomain:
+                cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids, domain_id = batch
+                domain_id = domain_id.to(accelerator.device)
+            else:
+                cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids = batch
+                domain_id = None
             cycle_curve_data = cycle_curve_data.float().to(accelerator.device)# [B, S, N]
             curve_attn_mask = curve_attn_mask.float().to(accelerator.device)
             labels = labels.float().to(accelerator.device)
 
             # encoder - decoder
-            outputs = model(cycle_curve_data, curve_attn_mask)
+            if domain_id is not None:
+                outputs = model(cycle_curve_data, curve_attn_mask, domain_id=domain_id)
+            else:
+                outputs = model(cycle_curve_data, curve_attn_mask)
             # self.accelerator.wait_for_everyone()
-            std, mean_value = np.sqrt(vali_data.label_scaler.var_[-1]), vali_data.label_scaler.mean_[-1]
-            transformed_preds = outputs * std + mean_value
-            transformed_labels = labels * std + mean_value
+            if domain_id is not None and getattr(args, 'label_scaling', 'global') == 'per_domain':
+                dmean = torch.as_tensor(args._domain_means, device=accelerator.device, dtype=outputs.dtype)[domain_id]
+                dstd = torch.as_tensor(args._domain_stds, device=accelerator.device, dtype=outputs.dtype)[domain_id]
+                transformed_preds = outputs.reshape(-1) * dstd + dmean
+                transformed_labels = labels.reshape(-1) * dstd + dmean
+            else:
+                std, mean_value = np.sqrt(vali_data.label_scaler.var_[-1]), vali_data.label_scaler.mean_[-1]
+                transformed_preds = outputs * std + mean_value
+                transformed_labels = labels * std + mean_value
 
-            all_predictions, all_targets, seen_unseen_ids = accelerator.gather_for_metrics((transformed_preds, transformed_labels, seen_unseen_ids))
+            if multidomain:
+                all_predictions, all_targets, seen_unseen_ids, gathered_domain = accelerator.gather_for_metrics(
+                    (transformed_preds, transformed_labels, seen_unseen_ids, domain_id))
+                total_domain_ids = total_domain_ids + gathered_domain.detach().cpu().numpy().reshape(-1).tolist()
+            else:
+                all_predictions, all_targets, seen_unseen_ids = accelerator.gather_for_metrics((transformed_preds, transformed_labels, seen_unseen_ids))
 
-         
             total_preds = total_preds + all_predictions.detach().cpu().numpy().reshape(-1).tolist()
             total_references = total_references + all_targets.detach().cpu().numpy().reshape(-1).tolist()
             if compute_seen_unseen:
                 total_seen_unseen_ids = total_seen_unseen_ids + seen_unseen_ids.detach().cpu().numpy().reshape(-1).tolist()
 
     total_preds = np.array(total_preds)
-    total_references = np.array(total_references)   
+    total_references = np.array(total_references)
     total_seen_unseen_ids = np.array(total_seen_unseen_ids)
+    # [H3] per-domain breakdown (logged only; return signature unchanged)
+    if multidomain and len(total_domain_ids) > 0:
+        from utils.domain_utils import per_domain_metrics
+        pdm = per_domain_metrics(total_preds, total_references, total_domain_ids, alpha=args.alpha1)
+        accelerator.print('[H3] per-domain | ' + ' | '.join(
+            f"{k}: MAPE={v['mape']:.4f} {int(args.alpha1*100)}%-Acc={v['acc']:.4f} (n={v['n']})"
+            for k, v in pdm.items()))
     rmse = root_mean_squared_error(total_references, total_preds)
     mae = mean_absolute_error(total_references, total_preds)
     mape = mean_absolute_percentage_error(total_references, total_preds)

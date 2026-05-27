@@ -10,6 +10,8 @@ import copy
 from sklearn.preprocessing import StandardScaler
 from scipy.interpolate import interp1d
 from utils.timefeatures import time_features
+from utils.physics_features import add_physics_channels  # [H2]
+from utils.domain_utils import filename_to_domain_id      # [H3]
 import warnings
 import pickle
 from sklearn.cluster import k_means
@@ -78,6 +80,22 @@ def my_collate_fn_baseline(samples):
     tmp_curve_attn_mask = curve_attn_mask.unsqueeze(-1).unsqueeze(-1) * torch.ones_like(cycle_curve_data)
     cycle_curve_data[tmp_curve_attn_mask==0] = 0 # set the unseen data as zeros
     return cycle_curve_data, curve_attn_mask,  labels, life_class, scaled_life_class, weights, seen_unseen_ids
+
+
+def my_collate_fn_multidomain(samples):
+    # [H3] same as my_collate_fn_baseline but additionally returns domain_id per sample.
+    cycle_curve_data = torch.vstack([i['cycle_curve_data'].unsqueeze(0) for i in samples])
+    curve_attn_mask = torch.vstack([i['curve_attn_mask'].unsqueeze(0) for i in samples])
+    life_class = torch.Tensor([i['life_class'] for i in samples])
+    labels = torch.Tensor([i['labels'] for i in samples])
+    scaled_life_class = torch.Tensor([i['scaled_life_class'] for i in samples])
+    weights = torch.Tensor([i['weight'] for i in samples])
+    seen_unseen_ids = torch.Tensor([i['seen_unseen_id'] for i in samples])
+    domain_ids = torch.LongTensor([i['domain_id'] for i in samples])
+
+    tmp_curve_attn_mask = curve_attn_mask.unsqueeze(-1).unsqueeze(-1) * torch.ones_like(cycle_curve_data)
+    cycle_curve_data[tmp_curve_attn_mask==0] = 0 # set the unseen data as zeros
+    return cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids, domain_ids
 
 class Dataset_original(Dataset):
     def __init__(self, args, flag='train', label_scaler=None, tokenizer=None, eval_cycle_max=None, eval_cycle_min=None, total_prompts=None, 
@@ -163,8 +181,20 @@ class Dataset_original(Dataset):
             self.test_files = split_recorder.XJTU_test_files
         elif self.dataset == 'MIX_large':
             self.train_files = split_recorder.MIX_large_train_files
-            self.val_files = split_recorder.MIX_large_val_files 
+            self.val_files = split_recorder.MIX_large_val_files
             self.test_files = split_recorder.MIX_large_test_files
+        elif self.dataset == 'MIX_all':            # [H3] joint 4-domain split (seed 2021)
+            self.train_files = split_recorder.MIX_all_train_files
+            self.val_files = split_recorder.MIX_all_val_files
+            self.test_files = split_recorder.MIX_all_test_files
+        elif self.dataset == 'MIX_all42':          # [H3] joint 4-domain split (seed 42)
+            self.train_files = split_recorder.MIX_all_42_train_files
+            self.val_files = split_recorder.MIX_all_42_val_files
+            self.test_files = split_recorder.MIX_all_42_test_files
+        elif self.dataset == 'MIX_all2024':        # [H3] joint 4-domain split (seed 2024)
+            self.train_files = split_recorder.MIX_all_2024_train_files
+            self.val_files = split_recorder.MIX_all_2024_val_files
+            self.test_files = split_recorder.MIX_all_2024_test_files
         elif self.dataset == 'ZN-coin':
             self.train_files = split_recorder.ZNcoin_train_files
             self.val_files = split_recorder.ZNcoin_val_files 
@@ -255,6 +285,31 @@ class Dataset_original(Dataset):
             self.scaled_life_classes = np.array(self.class_labels) - 1
             #self.scaled_life_classes = self.life_class_scaler.transform(np.array(self.class_labels).reshape(-1,1))
 
+        # [H3] optional per-domain label scaling: overrides the global transform above so each
+        # domain's targets are ~N(0,1) (a single global scaler squashes the small-life domains).
+        # Train fits per-domain mean/std; val/test reuse train stats stashed on args by run_main.
+        self.label_scaling = getattr(args, 'label_scaling', 'global')
+        self.per_domain_scaling = (self.label_scaling == 'per_domain')
+        if self.per_domain_scaling:
+            num_domains = getattr(args, 'num_domains', 4)
+            if flag == 'train' and label_scaler is None:
+                ul = np.array(self.unique_labels, dtype=float)
+                uld = np.array(self.unique_label_domains, dtype=int)
+                self.domain_means = np.zeros(num_domains)
+                self.domain_stds = np.ones(num_domains)
+                for d in range(num_domains):
+                    vals = ul[uld == d]
+                    if len(vals) > 0:
+                        self.domain_means[d] = vals.mean()
+                        self.domain_stds[d] = vals.std() if vals.std() > 1e-8 else 1.0
+            else:
+                # reuse train-domain stats (run_main stashes them on args after building train_data)
+                self.domain_means = np.asarray(getattr(args, '_domain_means'))
+                self.domain_stds = np.asarray(getattr(args, '_domain_stds'))
+            dom = np.array(self.total_domain_ids, dtype=int)
+            raw = np.array(self.raw_labels, dtype=float).reshape(-1)
+            self.total_labels = ((raw - self.domain_means[dom]) / self.domain_stds[dom]).reshape(-1, 1)
+
     def get_loss_weight(self, method='KDE'):
         '''
         Get the weight for weighted loss
@@ -330,6 +385,8 @@ class Dataset_original(Dataset):
         total_dataset_ids = []
         total_cj_aug_charge_discharge_curves = []
         total_seen_unseen_IDs = []
+        total_domain_ids = []        # [H3] per-sample domain id (0=Li-ion,1=Zn,2=Na,3=CALB)
+        unique_label_domains = []    # [H3] per-cell domain id, aligned with unique_labels
 
         for file_name in tqdm(self.files):
             if file_name not in split_recorder.MICH_EXP_test_files and file_name not in split_recorder.MICH_EXP_train_files and file_name not in split_recorder.MICH_EXP_val_files:
@@ -356,6 +413,9 @@ class Dataset_original(Dataset):
             total_labels += labels 
             total_dataset_ids += [dataset_id for _ in range(len(labels))]
             # total_center_vector_indices += [center_vector_index for _ in range(len(labels))]
+            domain_id = filename_to_domain_id(file_name)                  # [H3]
+            total_domain_ids += [domain_id for _ in range(len(labels))]   # [H3]
+            unique_label_domains.append(domain_id)                        # [H3]
             unique_labels.append(eol)
             if self.flag == 'test':
                 seen_unseen_id = self.unseen_seen_record[file_name]
@@ -368,6 +428,8 @@ class Dataset_original(Dataset):
             else:
                 total_seen_unseen_IDs += [1 for _ in range(len(labels))] # 1 indicates seen. This is not used on training or evaluation set
 
+        self.total_domain_ids = total_domain_ids                         # [H3]
+        self.unique_label_domains = unique_label_domains                  # [H3]
         return total_charge_discharge_curves, total_curve_attn_masks, np.array(total_labels), unique_labels, class_labels, total_dataset_ids, total_cj_aug_charge_discharge_curves, total_seen_unseen_IDs
 
     
@@ -624,6 +686,9 @@ class Dataset_original(Dataset):
             curves.append(curve_data.reshape(1, curve_data.shape[0], self.charge_discharge_len))
               
         curves = np.concatenate(curves, axis=0) # [L, 3, fixed_len]
+        # [H2] optionally append physics-derived channels (dQ/dV, deltaQ(V)) -> [L, 3+n, fixed_len]
+        if getattr(self.args, 'input_channels', 'base') == 'physics':
+            curves = add_physics_channels(curves)
         return curves
 
     def resample_charge_discharge_curves(self, voltages, currents, capacity_in_battery):
@@ -654,7 +719,8 @@ class Dataset_original(Dataset):
                 'weight': self.weights[index],
                 'dataset_id': self.total_dataset_ids[index],
                 'cj_cycle_curve_data': self.total_cj_aug_charge_discharge_curves[index],
-                'seen_unseen_id': self.total_seen_unseen_IDs[index]
+                'seen_unseen_id': self.total_seen_unseen_IDs[index],
+                'domain_id': self.total_domain_ids[index]                 # [H3]
             }
         return sample
     
